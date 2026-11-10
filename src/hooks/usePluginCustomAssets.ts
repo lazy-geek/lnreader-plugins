@@ -39,7 +39,7 @@ export function usePluginCustomAssets(
       const styleElement = document.createElement('style');
       styleElement.id = 'plugin-custom-css';
 
-      fetch(`/public/static/${plugin.customCSS}`)
+      fetch(`/static/${plugin.customCSS}`)
         .then(response => response.text())
         .then(cssContent => {
           styleElement.textContent = cssContent;
@@ -73,7 +73,7 @@ export function usePluginCustomAssets(
     if (plugin?.customJS && chapterText) {
       const scriptElement = document.createElement('script');
       scriptElement.id = 'plugin-custom-js';
-      scriptElement.src = `/public/static/${plugin.customJS}`;
+      scriptElement.src = `/static/${plugin.customJS}`;
 
       scriptElement.onload = () => {
         console.log('Custom JS loaded successfully');
