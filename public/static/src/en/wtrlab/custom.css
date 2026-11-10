@@ -1,0 +1,43 @@
+/* Base styles for WTR-LAB highlighted terms in LNReader */
+.text-patch {
+  color: #2563eb;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+@media (prefers-color-scheme: dark) {
+  .text-patch {
+    color: #60a5fa;
+  }
+}
+
+.text-patch:hover,
+.text-patch:active {
+  opacity: 0.8;
+}
+
+/* User-defined term distinction */
+.text-patch.user_term {
+  color: #059669;
+}
+
+@media (prefers-color-scheme: dark) {
+  .text-patch.user_term {
+    color: #34d399;
+  }
+}
+
+/* Patch distinction */
+.text-patch.patch {
+  color: #7c3aed;
+}
+
+@media (prefers-color-scheme: dark) {
+  .text-patch.patch {
+    color: #a78bfa;
+  }
+}
