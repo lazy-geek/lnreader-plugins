@@ -410,7 +410,7 @@ class WTRLAB implements Plugin.PluginBase {
   id = 'WTRLAB';
   name = 'WTR-LAB';
   site = 'https://wtr-lab.com/';
-  version = '1.4.0';
+  version = '1.4.1';
   icon = 'src/en/wtrlab/icon.png';
   customCSS = 'src/en/wtrlab/custom.css';
   sourceLang = 'en/';
@@ -479,6 +479,7 @@ class WTRLAB implements Plugin.PluginBase {
         { label: 'Amber / Gold', value: 'amber' },
         { label: 'Rose / Red', value: 'rose' },
         { label: 'Cyan', value: 'cyan' },
+        { label: 'None (inherit text color)', value: 'none' },
         { label: 'Custom (set hex code below)', value: 'custom' },
       ],
     },
@@ -547,7 +548,10 @@ class WTRLAB implements Plugin.PluginBase {
     let lightColor = colorMap.blue.light;
     let darkColor = colorMap.blue.dark;
 
-    if (colorPreset === 'custom' && customHex) {
+    if (colorPreset === 'none') {
+      lightColor = 'inherit';
+      darkColor = 'inherit';
+    } else if (colorPreset === 'custom' && customHex) {
       lightColor = customHex;
       darkColor = customHex;
     } else if (colorMap[colorPreset]) {
@@ -585,22 +589,32 @@ class WTRLAB implements Plugin.PluginBase {
     ${decoLightRule}
     ${extraCSS}
   }
+  ${
+    colorPreset === 'none'
+      ? ''
+      : `
   .text-patch.user_term {
     color: #059669;
   }
   .text-patch.patch {
     color: #7c3aed;
+  }`
   }
   @media (prefers-color-scheme: dark) {
     .text-patch {
       color: ${darkColor};
       ${decoDarkRule}
     }
+    ${
+      colorPreset === 'none'
+        ? ''
+        : `
     .text-patch.user_term {
       color: #34d399;
     }
     .text-patch.patch {
       color: #a78bfa;
+    }`
     }
   }
 </style>`;
