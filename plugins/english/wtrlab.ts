@@ -29,6 +29,28 @@ function escapeHtml(str: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function escapeAttr(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function renderTermSpan(
+  text: string,
+  source: string,
+  target: string,
+  type = 'system',
+): string {
+  return `<span class="text-patch ${escapeAttr(type)}" data-hash="${escapeAttr(
+    source,
+  )}" data-target="${escapeAttr(target)}" data-type="${escapeAttr(
+    type,
+  )}" style="cursor:pointer;">${escapeHtml(text)}</span>`;
+}
+
 /** Undo the entities Google leaves around translated segments. */
 function decodeEntities(str: string): string {
   const named: Record<string, string> = {
@@ -158,10 +180,15 @@ function novelExtraAppears(text: string, source: string): boolean {
 }
 
 /** One glossary mapping: the Chinese source form and the wording to show. */
-type TermReplacement = { source: string; target: string };
+type TermReplacement = { source: string; target: string; type?: string };
 
 /** A glossary term compiled once, then reused for the title and every line. */
-type CompiledTerm = { pattern: RegExp; target: string };
+type CompiledTerm = {
+  pattern: RegExp;
+  target: string;
+  source: string;
+  type: string;
+};
 
 /** A single accepted term occurrence inside a paragraph. */
 type TermHit = {
@@ -169,13 +196,15 @@ type TermHit = {
   length: number;
   match: string;
   target: string;
+  source: string;
+  type: string;
 };
 
 function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
   const seen = new Set<string>();
   const compiled: CompiledTerm[] = [];
 
-  for (const { source, target } of terms) {
+  for (const { source, target, type } of terms) {
     if (!source || !target) continue;
     const variants = source
       .split('|')
@@ -183,7 +212,8 @@ function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
       .filter(Boolean);
     if (variants.length === 0) continue;
 
-    const key = `${variants.join('|')}\u0000${target}`;
+    const termType = type || 'system';
+    const key = `${variants.join('|')}\u0000${target}\u0000${termType}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
@@ -198,6 +228,8 @@ function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
       compiled.push({
         pattern: new RegExp(alternatives.join('|'), 'gi'),
         target,
+        source,
+        type: termType,
       });
     } catch {
       // A term the regex engine rejects is skipped, not fatal to the chapter.
@@ -208,7 +240,12 @@ function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
 }
 
 /** One piece of a line: literal text, or a term with its replacement. */
-type TermSegment = { text: string; target?: string };
+type TermSegment = {
+  text: string;
+  target?: string;
+  source?: string;
+  type?: string;
+};
 
 /** A translated paragraph split into untagged text and `<a i=id>` segments. */
 type TaggedToken = { text: string; id?: number };
@@ -241,7 +278,7 @@ function parseTaggedLine(rawLine: string): TaggedToken[] {
 /** Every place a glossary term occurs, before overlaps are resolved. */
 function collectTermHits(text: string, compiled: CompiledTerm[]): TermHit[] {
   const hits: TermHit[] = [];
-  for (const { pattern, target } of compiled) {
+  for (const { pattern, target, source, type } of compiled) {
     pattern.lastIndex = 0;
     let found: RegExpExecArray | null;
     let guard = 0;
@@ -256,6 +293,8 @@ function collectTermHits(text: string, compiled: CompiledTerm[]): TermHit[] {
         length: found[0].trim().length,
         match: found[0],
         target,
+        source,
+        type,
       });
     }
   }
@@ -325,7 +364,12 @@ function splitTermSegments(
     if (previousWasTerm && !pending.endsWith(' ')) pending += ' ';
     flush();
 
-    segments.push({ text: '', target: regularBrackets(hit.target) });
+    segments.push({
+      text: '',
+      target: regularBrackets(hit.target),
+      source: hit.source,
+      type: hit.type,
+    });
     if (atBreak || (!han && /^[A-Za-z0-9]/.test(after))) pending = ' ';
 
     cursor = hit.index + hit.match.length;
@@ -339,11 +383,26 @@ function splitTermSegments(
 }
 
 /** Apply the glossary to text that is already in its final language. */
-function applyTerms(text: string, compiled: CompiledTerm[]): string {
+function applyTerms(
+  text: string,
+  compiled: CompiledTerm[],
+  highlight = true,
+): string {
   return splitTermSegments(text, compiled)
-    .map(segment =>
-      segment.target === undefined ? segment.text : escapeHtml(segment.target),
-    )
+    .map(segment => {
+      if (segment.target === undefined) {
+        return segment.text;
+      }
+      if (highlight) {
+        return renderTermSpan(
+          segment.target,
+          segment.source || '',
+          segment.target,
+          segment.type || 'system',
+        );
+      }
+      return escapeHtml(segment.target);
+    })
     .join('');
 }
 
@@ -351,8 +410,9 @@ class WTRLAB implements Plugin.PluginBase {
   id = 'WTRLAB';
   name = 'WTR-LAB';
   site = 'https://wtr-lab.com/';
-  version = '1.3.0';
+  version = '1.4.0';
   icon = 'src/en/wtrlab/icon.png';
+  customCSS = 'src/en/wtrlab/custom.css';
   sourceLang = 'en/';
   baggage = '';
   trace = '';
@@ -403,7 +463,148 @@ class WTRLAB implements Plugin.PluginBase {
       label: 'Show which translation was used at the top of each chapter',
       type: 'Switch',
     },
+    highlightTerms: {
+      value: true,
+      label: 'Highlight glossary terms in chapters',
+      type: 'Switch',
+    },
+    termHighlightColor: {
+      value: 'blue',
+      label: 'Term highlight color',
+      type: 'Select',
+      options: [
+        { label: 'Blue (wtr-lab default)', value: 'blue' },
+        { label: 'Emerald Green', value: 'green' },
+        { label: 'Purple', value: 'purple' },
+        { label: 'Amber / Gold', value: 'amber' },
+        { label: 'Rose / Red', value: 'rose' },
+        { label: 'Cyan', value: 'cyan' },
+        { label: 'Custom (set hex code below)', value: 'custom' },
+      ],
+    },
+    termCustomHexColor: {
+      value: '',
+      label:
+        'Custom term color — used when "Custom" is selected above (e.g. #3b82f6 or #00d2ff)',
+      type: 'Text',
+    },
+    termFontWeight: {
+      value: 'semibold',
+      label: 'Term font weight',
+      type: 'Select',
+      options: [
+        { label: 'Semi-bold (600)', value: 'semibold' },
+        { label: 'Bold (700)', value: 'bold' },
+        { label: 'Normal (inherit)', value: 'normal' },
+      ],
+    },
+    termDecoration: {
+      value: 'none',
+      label: 'Term text decoration',
+      type: 'Select',
+      options: [
+        { label: 'None (plain text)', value: 'none' },
+        { label: 'Dotted underline', value: 'dotted' },
+        { label: 'Solid underline', value: 'underline' },
+        { label: 'Badge / Pill background', value: 'badge' },
+      ],
+    },
+    termCustomCSS: {
+      value: '',
+      label: 'Advanced: Extra custom CSS for terms (e.g. border-radius: 4px;)',
+      type: 'Text',
+    },
   };
+
+  /** Generate user-customized CSS rules for highlighted terms. */
+  buildTermStyleSheet(): string {
+    const highlight = storage.get<boolean>('highlightTerms') !== false;
+    if (!highlight) {
+      return '<style id="wtr-term-styles">.text-patch { cursor: default; }</style>';
+    }
+
+    const colorPreset = (
+      storage.get<string>('termHighlightColor') || 'blue'
+    ).toLowerCase();
+    const customHex = (storage.get<string>('termCustomHexColor') || '').trim();
+    const fontWeight = (
+      storage.get<string>('termFontWeight') || 'semibold'
+    ).toLowerCase();
+    const decoration = (
+      storage.get<string>('termDecoration') || 'none'
+    ).toLowerCase();
+    const extraCSS = (storage.get<string>('termCustomCSS') || '').trim();
+
+    const colorMap: Record<string, { light: string; dark: string }> = {
+      blue: { light: '#2563eb', dark: '#60a5fa' },
+      green: { light: '#059669', dark: '#34d399' },
+      purple: { light: '#7c3aed', dark: '#a78bfa' },
+      amber: { light: '#d97706', dark: '#fbbf24' },
+      rose: { light: '#e11d48', dark: '#f43f5e' },
+      cyan: { light: '#0891b2', dark: '#38bdf8' },
+    };
+
+    let lightColor = colorMap.blue.light;
+    let darkColor = colorMap.blue.dark;
+
+    if (colorPreset === 'custom' && customHex) {
+      lightColor = customHex;
+      darkColor = customHex;
+    } else if (colorMap[colorPreset]) {
+      lightColor = colorMap[colorPreset].light;
+      darkColor = colorMap[colorPreset].dark;
+    }
+
+    let weightRule = '600';
+    if (fontWeight === 'bold') weightRule = '700';
+    else if (fontWeight === 'normal') weightRule = 'inherit';
+
+    let decoLightRule = 'text-decoration: none;';
+    let decoDarkRule = 'text-decoration: none;';
+
+    if (decoration === 'dotted') {
+      decoLightRule =
+        'border-bottom: 1.5px dotted currentColor; text-decoration: none;';
+      decoDarkRule = decoLightRule;
+    } else if (decoration === 'underline') {
+      decoLightRule =
+        'text-decoration: underline; text-decoration-thickness: 1.5px;';
+      decoDarkRule = decoLightRule;
+    } else if (decoration === 'badge') {
+      decoLightRule =
+        'background: rgba(37, 99, 235, 0.12); padding: 0.1em 0.35em; border-radius: 3px;';
+      decoDarkRule =
+        'background: rgba(96, 165, 250, 0.2); padding: 0.1em 0.35em; border-radius: 3px;';
+    }
+
+    return `<style id="wtr-term-styles">
+  .text-patch {
+    color: ${lightColor};
+    font-weight: ${weightRule};
+    cursor: pointer;
+    ${decoLightRule}
+    ${extraCSS}
+  }
+  .text-patch.user_term {
+    color: #059669;
+  }
+  .text-patch.patch {
+    color: #7c3aed;
+  }
+  @media (prefers-color-scheme: dark) {
+    .text-patch {
+      color: ${darkColor};
+      ${decoDarkRule}
+    }
+    .text-patch.user_term {
+      color: #34d399;
+    }
+    .text-patch.patch {
+      color: #a78bfa;
+    }
+  }
+</style>`;
+  }
 
   /** Full Cookie header value supplied by the user in plugin settings. */
   get sessionCookie(): string {
@@ -1206,22 +1407,30 @@ class WTRLAB implements Plugin.PluginBase {
       const novel = novelGlossary.get(termHash(source));
       candidates.push(
         novel
-          ? { source: novel.zh, target: novel.en }
-          : { source, target: chapterTermText(entry) || source },
+          ? { source: novel.zh, target: novel.en, type: 'system' }
+          : {
+              source,
+              target: chapterTermText(entry) || source,
+              type: 'system',
+            },
       );
     }
 
     if (includeNovelExtras) {
       novelGlossary.forEach(novel => {
         if (novelExtraAppears(rawBodyText, novel.zh)) {
-          candidates.push({ source: novel.zh, target: novel.en });
+          candidates.push({
+            source: novel.zh,
+            target: novel.en,
+            type: 'system',
+          });
         }
       });
     }
 
     for (const patch of patches) {
       if (patch?.zh && patch?.en) {
-        candidates.push({ source: patch.zh, target: patch.en });
+        candidates.push({ source: patch.zh, target: patch.en, type: 'patch' });
       }
     }
 
@@ -1238,6 +1447,7 @@ class WTRLAB implements Plugin.PluginBase {
     paragraphData: string | string[],
     chapterTerms: GlossaryTerm[],
     candidates: TermReplacement[],
+    highlight = true,
   ): Promise<string[]> {
     const paragraphs = Array.isArray(paragraphData)
       ? paragraphData
@@ -1272,15 +1482,28 @@ class WTRLAB implements Plugin.PluginBase {
       // The site keeps the pre-translation item when a line has no response.
       if (!translated[index]) {
         return segments
-          .map(segment => escapeHtml(segment.target ?? segment.text))
+          .map(segment =>
+            segment.target !== undefined && highlight
+              ? renderTermSpan(
+                  segment.target,
+                  segment.source || '',
+                  segment.target,
+                  segment.type || 'system',
+                )
+              : escapeHtml(segment.target ?? segment.text),
+          )
           .join('');
       }
-      return this.rebuildTagged(translated[index], segments);
+      return this.rebuildTagged(translated[index], segments, highlight);
     });
   }
 
   /** Reassemble one translated tagged paragraph, keeping term targets. */
-  rebuildTagged(line: string, segments: TermSegment[]): string {
+  rebuildTagged(
+    line: string,
+    segments: TermSegment[],
+    highlight = true,
+  ): string {
     const tokens = parseTaggedLine(line);
     // The site falls back to the whole translated line when the translator
     // drops every tag; the glossary segments would otherwise stay Chinese.
@@ -1290,7 +1513,16 @@ class WTRLAB implements Plugin.PluginBase {
         if (token.id === undefined) return escapeHtml(token.text);
         // The site keeps untranslated text at the parser level but drops
         // tagged text whose id has no matching glossary segment.
-        if (!segments[token.id]) return '';
+        const seg = segments[token.id];
+        if (!seg) return '';
+        if (seg.target !== undefined && highlight) {
+          return renderTermSpan(
+            token.text,
+            seg.source || '',
+            seg.target,
+            seg.type || 'system',
+          );
+        }
         return escapeHtml(token.text);
       })
       .join('');
@@ -1456,7 +1688,8 @@ class WTRLAB implements Plugin.PluginBase {
       chapterTitle = replaceChapterTokens(chapterTitle, chapterTerms);
     }
 
-    let htmlString = '';
+    const highlightTerms = storage.get<boolean>('highlightTerms') !== false;
+    let htmlString = this.buildTermStyleSheet();
 
     const encrypted =
       chapterContent.toString().startsWith('arr:') ||
@@ -1500,6 +1733,7 @@ class WTRLAB implements Plugin.PluginBase {
             chapterContent,
             chapterTerms,
             termCandidates,
+            highlightTerms,
           )
         : await this.translate(chapterContent);
       usedType = `${usedType} + Google Translate (on-device)`;
@@ -1527,7 +1761,7 @@ class WTRLAB implements Plugin.PluginBase {
     );
 
     if (chapterTitle) {
-      htmlString += `<h3>${applyTerms(chapterTitle, matcher)}</h3>`;
+      htmlString += `<h3>${applyTerms(chapterTitle, matcher, highlightTerms)}</h3>`;
     }
 
     if (storage.get<boolean>('showModeNotice') !== false && usedType) {
@@ -1554,19 +1788,12 @@ class WTRLAB implements Plugin.PluginBase {
       return this.site.replace(/\/$/, '') + '/' + imgUrl.replace(/^\//, '');
     };
 
-    const escapeAttr = (str: string): string =>
-      str
-        .replace(/&/g, '&amp;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-
     for (let text of paragraphs) {
       if (typeof text !== 'string') continue;
       text = applyTerms(
         replaceChapterTokens(resolveTokens(text, true), chapterTerms),
         matcher,
+        highlightTerms,
       );
 
       if (/\[\s*image\s*\]/i.test(text)) {
