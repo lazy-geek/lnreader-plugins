@@ -179,6 +179,127 @@ function novelExtraAppears(text: string, source: string): boolean {
     .some(piece => piece.length > 0 && text.includes(piece));
 }
 
+/** A user-defined glossary entry from /api/v2/user/config */
+type UserTermItem = {
+  id?: string;
+  to: string;
+  from: string;
+  case?: boolean;
+  filter?: number[];
+  source?: number;
+  source_id?: string;
+  source_hash?: string;
+};
+
+/** Parse a raw user term tuple or object from user config. */
+function parseUserTerm(raw: unknown): UserTermItem | null {
+  if (Array.isArray(raw)) {
+    const to = typeof raw[1] === 'string' ? raw[1].trim() : '';
+    const from = typeof raw[2] === 'string' ? raw[2].trim() : '';
+    if (!to || !from) return null;
+    return {
+      id: raw[0] != null ? String(raw[0]) : undefined,
+      to,
+      from,
+      case: Boolean(raw[3]),
+      filter: Array.isArray(raw[4])
+        ? raw[4]
+            .map((n: unknown) => parseInt(String(n), 10))
+            .filter((n: number) => !isNaN(n))
+        : [],
+      source:
+        typeof raw[5] === 'number'
+          ? raw[5]
+          : parseInt(String(raw[5]), 10) || undefined,
+      source_id: typeof raw[6] === 'string' ? raw[6] : undefined,
+      source_hash: typeof raw[7] === 'string' ? raw[7] : undefined,
+    };
+  }
+  if (raw && typeof raw === 'object') {
+    const obj = raw as Record<string, unknown>;
+    const to = typeof obj.to === 'string' ? obj.to.trim() : '';
+    const from = typeof obj.from === 'string' ? obj.from.trim() : '';
+    if (!to || !from) return null;
+    return {
+      id: obj.id != null ? String(obj.id) : undefined,
+      to,
+      from,
+      case: Boolean(obj.case),
+      filter: Array.isArray(obj.filter)
+        ? obj.filter
+            .map((n: unknown) => parseInt(String(n), 10))
+            .filter((n: number) => !isNaN(n))
+        : [],
+      source:
+        typeof obj.source === 'number'
+          ? obj.source
+          : parseInt(String(obj.source), 10) || undefined,
+      source_id: typeof obj.source_id === 'string' ? obj.source_id : undefined,
+      source_hash:
+        typeof obj.source_hash === 'string' ? obj.source_hash : undefined,
+    };
+  }
+  return null;
+}
+
+/**
+ * Filter user terms for a specific series/novel.
+ *
+ * Mirrors the site's `buildParsedUserTerms`:
+ * - Terms with no filter/source apply globally.
+ * - Terms with a `filter` array apply if `serieId` is included in `filter`.
+ * - Terms scoped to a `source` (raw_id) apply if `rawId === source`.
+ */
+function filterUserTerms(
+  userTerms: UserTermItem[],
+  serieId: number | null,
+  rawId: number | null,
+): UserTermItem[] {
+  return userTerms.filter(term => {
+    const hasFilter = Array.isArray(term.filter) && term.filter.length > 0;
+    if (hasFilter) {
+      if (serieId && term.filter!.includes(serieId)) return true;
+      return false;
+    }
+    if (term.source) {
+      if (rawId && term.source === rawId) return true;
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * Merge user terms over novel glossary.
+ *
+ * Mirrors the site's `buildCombinedTermsIndex`:
+ * Novel glossary entries are added first, then user terms overwrite them by hash.
+ */
+function buildCombinedGlossary(
+  novelGlossary: Map<string, NovelGlossaryTerm>,
+  userTerms: UserTermItem[],
+): Map<string, NovelGlossaryTerm> {
+  const combined = new Map<string, NovelGlossaryTerm>();
+  novelGlossary.forEach((term, key) => {
+    combined.set(key, term);
+  });
+  for (const userTerm of userTerms) {
+    for (const variant of userTerm.from.split('|')) {
+      const v = variant.trim();
+      if (!v) continue;
+      const key = termHash(v);
+      if (key) {
+        combined.set(key, {
+          en: userTerm.to,
+          zh: userTerm.from,
+          type: 'user_term',
+        });
+      }
+    }
+  }
+  return combined;
+}
+
 /** One glossary mapping: the Chinese source form and the wording to show. */
 type TermReplacement = { source: string; target: string; type?: string };
 
@@ -410,7 +531,7 @@ class WTRLAB implements Plugin.PluginBase {
   id = 'WTRLAB';
   name = 'WTR-LAB';
   site = 'https://wtr-lab.com/';
-  version = '1.4.1';
+  version = '1.5.0';
   icon = 'src/en/wtrlab/icon.png';
   customCSS = 'src/en/wtrlab/custom.css';
   sourceLang = 'en/';
@@ -422,6 +543,11 @@ class WTRLAB implements Plugin.PluginBase {
    * keep only a few novels; one fetch then serves every chapter of a novel.
    */
   glossaryCache = new Map<number, Map<string, NovelGlossaryTerm>>();
+
+  /**
+   * User's personal glossary terms cached in memory with a 60-second TTL.
+   */
+  userTermsCache: { terms: UserTermItem[]; timestamp: number } | null = null;
 
   pluginSettings = {
     signInUrl: {
@@ -461,6 +587,11 @@ class WTRLAB implements Plugin.PluginBase {
     showModeNotice: {
       value: true,
       label: 'Show which translation was used at the top of each chapter',
+      type: 'Switch',
+    },
+    useUserGlossary: {
+      value: true,
+      label: 'Use personal glossary from wtr-lab account (requires sign-in)',
       type: 'Switch',
     },
     highlightTerms: {
@@ -760,6 +891,7 @@ class WTRLAB implements Plugin.PluginBase {
         },
       });
       this.assertNotChallenged(res);
+      this.userTermsCache = null;
       const landedOn = (res.url || '').replace(this.site, '/') || 'unknown';
       return `Sign-in: redeem token HTTP ${res.status}, ended at ${landedOn}`;
     } catch (e) {
@@ -894,6 +1026,48 @@ class WTRLAB implements Plugin.PluginBase {
       }
     }
     return terms;
+  }
+
+  /**
+   * Fetch personal user glossary from wtr-lab account.
+   *
+   * Endpoint: /api/v2/user/config (authenticated via sessionCookie or WebView session).
+   * Terms are cached in memory for 60 seconds.
+   */
+  async fetchUserTerms(): Promise<UserTermItem[]> {
+    const enabled = storage.get<boolean>('useUserGlossary') !== false;
+    if (!enabled) return [];
+
+    const now = Date.now();
+    if (this.userTermsCache && now - this.userTermsCache.timestamp < 60000) {
+      return this.userTermsCache.terms;
+    }
+
+    try {
+      const res = await fetchApi(`${this.site}api/v2/user/config`, {
+        headers: {
+          'Accept': 'application/json',
+          ...(this.sessionCookie ? { Cookie: this.sessionCookie } : {}),
+        },
+      });
+      this.assertNotChallenged(res);
+      if (res.ok) {
+        const data = await res.json();
+        const rawTerms = data?.config?.terms;
+        if (Array.isArray(rawTerms)) {
+          const parsed: UserTermItem[] = [];
+          for (const raw of rawTerms) {
+            const item = parseUserTerm(raw);
+            if (item) parsed.push(item);
+          }
+          this.userTermsCache = { terms: parsed, timestamp: now };
+          return parsed;
+        }
+      }
+    } catch (error) {
+      console.warn('WTR-LAB user glossary unavailable:', String(error));
+    }
+    return [];
   }
 
   /** Translation modes to try, in order, based on plugin settings. */
@@ -1412,16 +1586,33 @@ class WTRLAB implements Plugin.PluginBase {
     novelGlossary: Map<string, NovelGlossaryTerm>,
     includeNovelExtras: boolean,
     rawBodyText: string,
+    userTerms: UserTermItem[] = [],
   ): TermReplacement[] {
     const candidates: TermReplacement[] = [];
+    const combinedGlossary = buildCombinedGlossary(novelGlossary, userTerms);
+
+    // 1. User terms that appear in the raw text have top priority
+    for (const userTerm of userTerms) {
+      if (termAppears(rawBodyText, userTerm.from)) {
+        candidates.push({
+          source: userTerm.from,
+          target: userTerm.to,
+          type: 'user_term',
+        });
+      }
+    }
 
     for (const entry of chapterTerms) {
       const source = typeof entry?.[1] === 'string' ? entry[1] : '';
       if (!source) continue;
-      const novel = novelGlossary.get(termHash(source));
+      const matched = combinedGlossary.get(termHash(source));
       candidates.push(
-        novel
-          ? { source: novel.zh, target: novel.en, type: 'system' }
+        matched
+          ? {
+              source: matched.zh,
+              target: matched.en,
+              type: matched.type || 'system',
+            }
           : {
               source,
               target: chapterTermText(entry) || source,
@@ -1431,12 +1622,12 @@ class WTRLAB implements Plugin.PluginBase {
     }
 
     if (includeNovelExtras) {
-      novelGlossary.forEach(novel => {
+      combinedGlossary.forEach(novel => {
         if (novelExtraAppears(rawBodyText, novel.zh)) {
           candidates.push({
             source: novel.zh,
             target: novel.en,
-            type: 'system',
+            type: novel.type || 'system',
           });
         }
       });
@@ -1695,6 +1886,14 @@ class WTRLAB implements Plugin.PluginBase {
         ? await this.fetchNovelGlossary(rawId)
         : new Map<string, NovelGlossaryTerm>();
 
+    const serieId: number | null =
+      typeof parsedJson?.chapter?.serie_id === 'number'
+        ? parsedJson.chapter.serie_id
+        : null;
+
+    const allUserTerms = await this.fetchUserTerms();
+    const userTerms = filterUserTerms(allUserTerms, serieId, rawId);
+
     let chapterTitle: string | undefined =
       parsedJson?.chapter?.title || content.title;
     if (chapterTitle) {
@@ -1736,6 +1935,7 @@ class WTRLAB implements Plugin.PluginBase {
       novelGlossary,
       isWebPlus,
       rawParagraphs.join('\n'),
+      userTerms,
     );
 
     // Web+ is Chinese even when the API did not encrypt the body, and the site
@@ -1779,7 +1979,9 @@ class WTRLAB implements Plugin.PluginBase {
     }
 
     if (storage.get<boolean>('showModeNotice') !== false && usedType) {
-      htmlString += `<p><small>Translation: ${usedType} — ${cookieState}</small></p>`;
+      const userTermNotice =
+        userTerms.length > 0 ? ` • ${userTerms.length} user terms` : '';
+      htmlString += `<p><small>Translation: ${usedType} — ${cookieState}${userTermNotice}</small></p>`;
     }
 
     if (attemptLog.length) {
@@ -3042,7 +3244,7 @@ type ChapterPatch = {
 };
 
 /** A novel glossary entry: the wording to show and the source forms it covers. */
-type NovelGlossaryTerm = { en: string; zh: string };
+type NovelGlossaryTerm = { en: string; zh: string; type?: string };
 
 type NovelGlossaryResponse = {
   success?: boolean;
