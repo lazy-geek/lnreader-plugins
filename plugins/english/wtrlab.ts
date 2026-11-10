@@ -29,6 +29,22 @@ function escapeHtml(str: string): string {
     .replace(/'/g, '&#39;');
 }
 
+/** Undo the entities Google leaves around translated segments. */
+function decodeEntities(str: string): string {
+  const named: Record<string, string> = {
+    nbsp: ' ',
+    amp: '&',
+    quot: '"',
+    lt: '<',
+    gt: '>',
+  };
+  return str
+    .replace(/&(nbsp|amp|quot|lt|gt);/g, (match, name: string) => named[name])
+    .replace(/&#(\d+);/gi, (match, code: string) =>
+      String.fromCharCode(parseInt(code, 10)),
+    );
+}
+
 function resolveTokens(
   str: string | undefined | null,
   escapeHtmlFlag = false,
@@ -50,15 +66,302 @@ function resolveTokens(
   );
 }
 
+/** Escape a literal string for use inside a regular expression. */
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** The site's `regular_brackets`: corner/lenticular brackets become ASCII. */
+function regularBrackets(str: string): string {
+  return str.replace(/[「【『]/g, '[').replace(/[」】』]/g, ']');
+}
+
+/** The site treats a term as Chinese when it contains a Han character. */
+function hasHan(text: string): boolean {
+  return /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(text);
+}
+
+/**
+ * AI chapter bodies mark glossary terms with `※N⛬` placeholders. The site
+ * swaps each placeholder for the source (Chinese) term and then rewrites that
+ * term to the preferred English translation from the novel glossary; the
+ * plugin used to stop after the first step and show the AI's per-chapter
+ * wording ("Heaven Rank Skill") instead of the site's ("Heavenly Rank
+ * Cultivation Method").
+ */
+const glossaryTokenPattern = /(?:wtr-lab\s+)?※([0-9]+)[⛬〓]/g;
+
+/** Novels whose glossary stays in memory; each one holds thousands of terms. */
+const glossaryCacheLimit = 3;
+
+/** The site caps replacements per paragraph to keep pathological data cheap. */
+const maxTermMatches = 100;
+
+function replaceChapterTokens(text: string, terms: GlossaryTerm[]): string {
+  if (terms.length === 0 || !text.includes('※')) return text;
+  return text.replace(glossaryTokenPattern, (match, index: string) => {
+    const entry = terms[parseInt(index, 10)];
+    const source = typeof entry?.[1] === 'string' ? entry[1] : '';
+    return source ? source.replace(/_/g, '') : match;
+  });
+}
+
+/** The AI's own wording for a chapter term, used when the novel has no entry. */
+function chapterTermText(entry: GlossaryTerm): string {
+  const value = entry?.[0];
+  // The site takes `translations[0] || source`, not the first non-empty one.
+  const first = Array.isArray(value) ? value[0] : value;
+  return typeof first === 'string' ? first.trim() : '';
+}
+
+/**
+ * The site's glossary key. Matching a chapter term against the novel glossary
+ * ignores `[.·-?？。_]`, so "天.阶" and "天阶" share one entry.
+ */
+function termHash(text: string): string {
+  return (text || '').replace(/[.·\-?？。_]/g, '');
+}
+
+/**
+ * One source term as a regex fragment. The site writes an `_` where a term may
+ * contain punctuation, and compiles it to "up to that many characters".
+ */
+function sourceTermPattern(source: string): string {
+  const normalized = source
+    .trim()
+    .replace(/^_+|_+$/g, '')
+    .replace(/[.·\-?？。]/g, '_');
+  return escapeRegExp(normalized).replace(/_+/g, run => `.{0,${run.length}}`);
+}
+
+/** True when any piece of a term (across `|` variants) occurs in the chapter. */
+function termAppears(text: string, source: string): boolean {
+  return (
+    source
+      .split('|')
+      // Punctuation is a wildcard in the compiled pattern, so treat it as one
+      // here too; otherwise "天.阶" would look absent from the text "天阶".
+      .flatMap(variant => variant.replace(/[.·\-?？。]/g, '_').split('_'))
+      .map(piece => piece.trim())
+      .some(piece => piece.length > 0 && text.includes(piece))
+  );
+}
+
+/**
+ * The site adds Web+ novel-glossary terms only when one of their
+ * underscore-separated pieces literally occurs in the raw body.
+ */
+function novelExtraAppears(text: string, source: string): boolean {
+  return (source || '')
+    .split('_')
+    .some(piece => piece.length > 0 && text.includes(piece));
+}
+
+/** One glossary mapping: the Chinese source form and the wording to show. */
+type TermReplacement = { source: string; target: string };
+
+/** A glossary term compiled once, then reused for the title and every line. */
+type CompiledTerm = { pattern: RegExp; target: string };
+
+/** A single accepted term occurrence inside a paragraph. */
+type TermHit = {
+  index: number;
+  length: number;
+  match: string;
+  target: string;
+};
+
+function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
+  const seen = new Set<string>();
+  const compiled: CompiledTerm[] = [];
+
+  for (const { source, target } of terms) {
+    if (!source || !target) continue;
+    const variants = source
+      .split('|')
+      .map(variant => variant.trim())
+      .filter(Boolean);
+    if (variants.length === 0) continue;
+
+    const key = `${variants.join('|')}\u0000${target}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const alternatives = variants
+      .map(sourceTermPattern)
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length);
+    if (alternatives.length === 0) continue;
+
+    try {
+      // Case-insensitive, like the site: terms are prose, not identifiers.
+      compiled.push({
+        pattern: new RegExp(alternatives.join('|'), 'gi'),
+        target,
+      });
+    } catch {
+      // A term the regex engine rejects is skipped, not fatal to the chapter.
+    }
+  }
+
+  return compiled;
+}
+
+/** One piece of a line: literal text, or a term with its replacement. */
+type TermSegment = { text: string; target?: string };
+
+/** A translated paragraph split into untagged text and `<a i=id>` segments. */
+type TaggedToken = { text: string; id?: number };
+
+/** Read the `<a i=id>…</a>` markup Google returns for a tagged paragraph. */
+function parseTaggedLine(rawLine: string): TaggedToken[] {
+  // Google sometimes decorates the echoed tags; the site strips the attribute
+  // before parsing and so must we, or the tag (and its text) would be lost.
+  const line = rawLine.replace(/\s?style=".*?"/gi, '');
+  const tokens: TaggedToken[] = [];
+  const pattern = /<(?:a|div)\s+i=["']?(\d+)["']?>([\s\S]*?)<\/(?:a|div)>/gi;
+  let cursor = 0;
+  let found: RegExpExecArray | null;
+  while ((found = pattern.exec(line)) !== null) {
+    if (found.index > cursor) {
+      tokens.push({ text: decodeEntities(line.slice(cursor, found.index)) });
+    }
+    tokens.push({
+      id: parseInt(found[1], 10),
+      text: decodeEntities(found[2]),
+    });
+    cursor = found.index + found[0].length;
+  }
+  if (cursor < line.length) {
+    tokens.push({ text: decodeEntities(line.slice(cursor)) });
+  }
+  return tokens;
+}
+
+/** Every place a glossary term occurs, before overlaps are resolved. */
+function collectTermHits(text: string, compiled: CompiledTerm[]): TermHit[] {
+  const hits: TermHit[] = [];
+  for (const { pattern, target } of compiled) {
+    pattern.lastIndex = 0;
+    let found: RegExpExecArray | null;
+    let guard = 0;
+    while ((found = pattern.exec(text)) !== null && guard++ < maxTermMatches) {
+      if (found[0].length === 0) {
+        // A zero-width match would spin forever; step past it.
+        pattern.lastIndex += 1;
+        continue;
+      }
+      hits.push({
+        index: found.index,
+        length: found[0].trim().length,
+        match: found[0],
+        target,
+      });
+    }
+  }
+
+  hits.sort((a, b) =>
+    a.index === b.index ? b.length - a.length : a.index - b.index,
+  );
+  return hits;
+}
+
+/**
+ * Split a line into text and glossary terms the way the site's renderer does:
+ * the longest match at a position wins, overlapping matches are dropped, a term
+ * never splits a Latin word, and a space is inserted where Chinese would not
+ * need one.
+ */
+function splitTermSegments(
+  text: string,
+  compiled: CompiledTerm[],
+): TermSegment[] {
+  // The site's renderer normalizes brackets even when no term matches.
+  if (compiled.length === 0) return [{ text: regularBrackets(text) }];
+
+  const hits = collectTermHits(text, compiled);
+  if (hits.length === 0) return [{ text: regularBrackets(text) }];
+
+  const segments: TermSegment[] = [];
+  let pending = '';
+  let cursor = 0;
+  let applied = 0;
+  let previousWasTerm = false;
+
+  const flush = () => {
+    if (!pending) return;
+    segments.push({ text: pending });
+    pending = '';
+  };
+
+  for (const hit of hits) {
+    if (applied >= maxTermMatches) break;
+    if (hit.index < cursor) continue;
+
+    const before = text.slice(cursor, hit.index);
+    const after = text.slice(hit.index + hit.match.length);
+    const han = hasHan(hit.match);
+    // A term ends a "word" only when whitespace or ")" follows it, and never
+    // right after a full stop.
+    const atBreak =
+      /[\s)]/.test(hit.match.slice(-1)) &&
+      !(before.length > 0 && /\.$/.test(before));
+
+    // Leave Latin words intact: "Clan" must not match inside "Clansman".
+    if (
+      !han &&
+      ((!atBreak && /^[A-Za-z0-9]/.test(after)) || /[A-Za-z0-9]$/.test(before))
+    ) {
+      continue;
+    }
+
+    let chunk = before;
+    if (/[A-Za-z0-9,]$/.test(chunk)) chunk += ' ';
+    if (chunk) {
+      pending += regularBrackets(chunk);
+      previousWasTerm = false;
+    }
+    // Two terms back to back would otherwise run together.
+    if (previousWasTerm && !pending.endsWith(' ')) pending += ' ';
+    flush();
+
+    segments.push({ text: '', target: regularBrackets(hit.target) });
+    if (atBreak || (!han && /^[A-Za-z0-9]/.test(after))) pending = ' ';
+
+    cursor = hit.index + hit.match.length;
+    previousWasTerm = true;
+    applied += 1;
+  }
+
+  pending += regularBrackets(text.slice(cursor));
+  flush();
+  return segments;
+}
+
+/** Apply the glossary to text that is already in its final language. */
+function applyTerms(text: string, compiled: CompiledTerm[]): string {
+  return splitTermSegments(text, compiled)
+    .map(segment =>
+      segment.target === undefined ? segment.text : escapeHtml(segment.target),
+    )
+    .join('');
+}
+
 class WTRLAB implements Plugin.PluginBase {
   id = 'WTRLAB';
   name = 'WTR-LAB';
   site = 'https://wtr-lab.com/';
-  version = '1.2.6';
+  version = '1.3.0';
   icon = 'src/en/wtrlab/icon.png';
   sourceLang = 'en/';
   baggage = '';
   trace = '';
+
+  /**
+   * Novel glossaries keyed by raw id. Each entry holds thousands of terms, so
+   * keep only a few novels; one fetch then serves every chapter of a novel.
+   */
+  glossaryCache = new Map<number, Map<string, NovelGlossaryTerm>>();
 
   pluginSettings = {
     signInUrl: {
@@ -298,6 +601,84 @@ class WTRLAB implements Plugin.PluginBase {
     } catch (e) {
       return `session check failed: ${String(e)}`;
     }
+  }
+
+  /**
+   * Preferred translations for the novel's glossary.
+   *
+   * The site loads this list and rewrites the AI's per-chapter wording to the
+   * preferred term (e.g. "Heaven Rank Skill" becomes "Heavenly Rank
+   * Cultivation Method"). The endpoint is public, so no session is needed,
+   * and one fetch covers every chapter of the novel.
+   */
+  async fetchNovelGlossary(
+    rawId: number,
+  ): Promise<Map<string, NovelGlossaryTerm>> {
+    const cached = this.glossaryCache.get(rawId);
+    if (cached) {
+      // Refresh recency so alternating between novels does not evict both.
+      this.glossaryCache.delete(rawId);
+      this.glossaryCache.set(rawId, cached);
+      return cached;
+    }
+
+    const terms = new Map<string, NovelGlossaryTerm>();
+    let loaded = false;
+    try {
+      const res = await fetchApi(
+        `${this.site}api/v2/reader/terms/${rawId}.json`,
+        {
+          headers: {
+            'Accept': 'application/json',
+            ...(this.sessionCookie ? { Cookie: this.sessionCookie } : {}),
+          },
+        },
+      );
+      this.assertNotChallenged(res);
+      if (res.ok) {
+        const body: NovelGlossaryResponse = await res.json();
+        for (const glossary of body?.glossaries ?? []) {
+          const data = glossary.data ?? glossary;
+          for (const entry of data?.terms ?? []) {
+            const alternatives = Array.isArray(entry?.[0])
+              ? entry[0]
+              : [entry?.[0]];
+            // The site index stores `translations[0] || source`; skip rows
+            // whose preferred wording is blank so they cannot hide a later,
+            // usable entry for the same source.
+            const preferred = (
+              alternatives.find(
+                (value): value is string =>
+                  typeof value === 'string' && value.trim().length > 0,
+              ) || ''
+            ).trim();
+            const source = typeof entry?.[1] === 'string' ? entry[1] : '';
+            if (!source || !preferred) continue;
+            for (const variant of source.split('|')) {
+              const key = termHash(variant.trim());
+              // First glossary in the payload wins, matching the site's index.
+              if (key && !terms.has(key)) {
+                terms.set(key, { en: preferred, zh: source });
+              }
+            }
+          }
+        }
+        loaded = true;
+      }
+    } catch (error) {
+      // The glossary is an enhancement: a chapter must still load without it.
+      console.warn('WTR-LAB glossary unavailable:', String(error));
+    }
+
+    // Do not cache a failed fetch; the next chapter should be able to retry.
+    if (loaded) {
+      this.glossaryCache.set(rawId, terms);
+      if (this.glossaryCache.size > glossaryCacheLimit) {
+        const oldest = this.glossaryCache.keys().next().value;
+        if (oldest !== undefined) this.glossaryCache.delete(oldest);
+      }
+    }
+    return terms;
   }
 
   /** Translation modes to try, in order, based on plugin settings. */
@@ -761,9 +1142,7 @@ class WTRLAB implements Plugin.PluginBase {
     return encKey;
   }
 
-  async translate(data: string[]): Promise<string[]> {
-    const contained = data.map((line, i) => `<a i=${i}>${line}</a>`);
-
+  async requestTranslation(lines: string[]): Promise<string[]> {
     const response = await fetchApi(
       'https://translate-pa.googleapis.com/v1/translateHtml',
       {
@@ -775,13 +1154,146 @@ class WTRLAB implements Plugin.PluginBase {
           'X-Goog-API-Key': 'AIzaSyATBXajvzQLTDHEQbcpq0Ihe0vWDHmO520',
         },
         'referrer': 'https://wtr-lab.com/',
-        'body': `[[${JSON.stringify(contained)},"zh-CN","en"],"te_lib"]`,
+        'body': `[[${JSON.stringify(lines)},"zh-CN","en"],"te_lib"]`,
         'method': 'POST',
       },
     );
     const translated = await response.json();
     const out = translated && translated[0] ? translated[0] : [];
     return out as string[];
+  }
+
+  async translate(data: string | string[]): Promise<string[]> {
+    const lines = Array.isArray(data) ? data : data.split('\n');
+    const contained = lines.map((line, i) => `<a i=${i}>${line}</a>`);
+    const translated = await this.requestTranslation(contained);
+    return lines.map((original, index) => {
+      const line = translated[index];
+      // The site keeps the original item when the translator returns nothing.
+      if (!line) return original;
+      // Google echoes the wrapper tag; the site reads the tag back by id and
+      // falls back to the whole line when the translator drops it.
+      const tokens = parseTaggedLine(line);
+      const tagged = tokens.find(token => token.id === index);
+      if (tagged) return tagged.text;
+      if (tokens.some(token => token.id !== undefined)) {
+        return tokens.map(token => token.text).join('');
+      }
+      return decodeEntities(line);
+    });
+  }
+
+  /**
+   * Build the site's ordered term list for one chapter.
+   *
+   * `eQ` on the site resolves each chapter term through the novel glossary,
+   * then adds Web+ novel terms that occur in the raw body, and finally the
+   * patches. Order matters: the renderer keeps the first term when a patch
+   * covers the same span.
+   */
+  buildTermCandidates(
+    chapterTerms: GlossaryTerm[],
+    patches: ChapterPatch[],
+    novelGlossary: Map<string, NovelGlossaryTerm>,
+    includeNovelExtras: boolean,
+    rawBodyText: string,
+  ): TermReplacement[] {
+    const candidates: TermReplacement[] = [];
+
+    for (const entry of chapterTerms) {
+      const source = typeof entry?.[1] === 'string' ? entry[1] : '';
+      if (!source) continue;
+      const novel = novelGlossary.get(termHash(source));
+      candidates.push(
+        novel
+          ? { source: novel.zh, target: novel.en }
+          : { source, target: chapterTermText(entry) || source },
+      );
+    }
+
+    if (includeNovelExtras) {
+      novelGlossary.forEach(novel => {
+        if (novelExtraAppears(rawBodyText, novel.zh)) {
+          candidates.push({ source: novel.zh, target: novel.en });
+        }
+      });
+    }
+
+    for (const patch of patches) {
+      if (patch?.zh && patch?.en) {
+        candidates.push({ source: patch.zh, target: patch.en });
+      }
+    }
+
+    return candidates;
+  }
+
+  /**
+   * Translate a Web+ chapter the way the site's `translateChapterContent`
+   * does: apply the glossary to the Chinese source first, tag every segment,
+   * send each whole paragraph as one translator line, then rebuild by tag id.
+   * Sending fragments separately loses the sentence context Google needs.
+   */
+  async translateWithTerms(
+    paragraphData: string | string[],
+    chapterTerms: GlossaryTerm[],
+    candidates: TermReplacement[],
+  ): Promise<string[]> {
+    const paragraphs = Array.isArray(paragraphData)
+      ? paragraphData
+      : paragraphData.split('\n');
+    // The site runs `eW` before `eY`: placeholders become source terms first.
+    const prepared = paragraphs.map(paragraph =>
+      replaceChapterTokens(paragraph, chapterTerms),
+    );
+
+    const text = prepared.join('\n');
+    const compiled = buildTermMatcher(
+      candidates.filter(({ source }) => termAppears(text, source)),
+    );
+    // The site tags even a term-free paragraph (one segment), so keep the same
+    // request shape whether or not this chapter has glossary hits.
+    const split = prepared.map(paragraph =>
+      splitTermSegments(paragraph, compiled),
+    );
+    // One line per paragraph, every segment tagged in place, exactly like the
+    // site builds its `parts` array.
+    const tagged = split.map(segments =>
+      segments
+        .map((segment, index) => {
+          const text =
+            segment.target === undefined ? segment.text : segment.target;
+          return `<a i=${index}>${text}</a>`;
+        })
+        .join(''),
+    );
+    const translated = await this.requestTranslation(tagged);
+    return split.map((segments, index) => {
+      // The site keeps the pre-translation item when a line has no response.
+      if (!translated[index]) {
+        return segments
+          .map(segment => escapeHtml(segment.target ?? segment.text))
+          .join('');
+      }
+      return this.rebuildTagged(translated[index], segments);
+    });
+  }
+
+  /** Reassemble one translated tagged paragraph, keeping term targets. */
+  rebuildTagged(line: string, segments: TermSegment[]): string {
+    const tokens = parseTaggedLine(line);
+    // The site falls back to the whole translated line when the translator
+    // drops every tag; the glossary segments would otherwise stay Chinese.
+    if (tokens.length === 0) return escapeHtml(decodeEntities(line));
+    return tokens
+      .map(token => {
+        if (token.id === undefined) return escapeHtml(token.text);
+        // The site keeps untranslated text at the parser level but drops
+        // tagged text whose id has no matching glossary segment.
+        if (!segments[token.id]) return '';
+        return escapeHtml(token.text);
+      })
+      .join('');
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
@@ -927,31 +1439,30 @@ class WTRLAB implements Plugin.PluginBase {
     }
 
     let chapterContent: any = content.body;
-    const chapterGlossary: ChapterContent['glossary_data'] | undefined =
-      content.glossary_data;
-    const dictionary = chapterGlossary?.terms?.map(t => t[0]) || [];
+    const chapterTerms = content.glossary_data?.terms ?? [];
+    const isWebPlus = usedType === 'webplus';
+    // Web chapters carry no glossary at all, so the novel glossary is only read
+    // when the body actually has terms to rewrite. Web+ always needs it: the
+    // site applies those terms before translating the Chinese source.
+    const novelGlossary =
+      isWebPlus || chapterTerms.length > 0
+        ? await this.fetchNovelGlossary(rawId)
+        : new Map<string, NovelGlossaryTerm>();
 
     let chapterTitle: string | undefined =
       parsedJson?.chapter?.title || content.title;
     if (chapterTitle) {
       chapterTitle = resolveTokens(chapterTitle, true);
-      if (dictionary.length > 0) {
-        chapterTitle = chapterTitle.replaceAll(
-          /(?:wtr-lab\s+)?※([0-9]+)[⛬〓]/g,
-          (m: string, index: string) => dictionary[parseInt(index)] || m,
-        );
-      }
+      chapterTitle = replaceChapterTokens(chapterTitle, chapterTerms);
     }
 
     let htmlString = '';
-    if (chapterTitle) {
-      htmlString += `<h3>${chapterTitle}</h3>`;
-    }
 
-    if (
+    const encrypted =
       chapterContent.toString().startsWith('arr:') ||
-      chapterContent.toString().startsWith('str:')
-    ) {
+      chapterContent.toString().startsWith('str:');
+
+    if (encrypted) {
       if (!loadedCheerio) {
         const body = await this.fetchSite(url).then(res => res.text());
 
@@ -963,8 +1474,60 @@ class WTRLAB implements Plugin.PluginBase {
         htmlString += `<p>${chapterContent.error.toString()}</p>`;
         return htmlString;
       }
-      chapterContent = await this.translate(chapterContent);
+    }
+
+    // The site builds its ordered term list from the raw (decrypted) body:
+    // chapter terms, then Web+ novel terms present in the body, then patches.
+    const rawParagraphs: string[] = Array.isArray(chapterContent)
+      ? chapterContent
+      : typeof chapterContent === 'string'
+        ? chapterContent.split('\n')
+        : [];
+    const termCandidates = this.buildTermCandidates(
+      chapterTerms,
+      content.patch ?? [],
+      novelGlossary,
+      isWebPlus,
+      rawParagraphs.join('\n'),
+    );
+
+    // Web+ is Chinese even when the API did not encrypt the body, and the site
+    // translates it either way; AI/Web bodies are only translated when the API
+    // marks them encrypted.
+    if (encrypted || isWebPlus) {
+      chapterContent = isWebPlus
+        ? await this.translateWithTerms(
+            chapterContent,
+            chapterTerms,
+            termCandidates,
+          )
+        : await this.translate(chapterContent);
       usedType = `${usedType} + Google Translate (on-device)`;
+    }
+
+    const paragraphs: string[] = Array.isArray(chapterContent)
+      ? chapterContent
+      : typeof chapterContent === 'string'
+        ? chapterContent.split('\n')
+        : [];
+
+    // Match only terms that occur in this chapter: the full novel glossary
+    // holds thousands of entries and most never appear in one chapter.
+    const probe = [
+      chapterTitle || '',
+      ...paragraphs.map(paragraph =>
+        typeof paragraph === 'string'
+          ? replaceChapterTokens(paragraph, chapterTerms)
+          : '',
+      ),
+    ].join('\n');
+
+    const matcher = buildTermMatcher(
+      termCandidates.filter(({ source }) => termAppears(probe, source)),
+    );
+
+    if (chapterTitle) {
+      htmlString += `<h3>${applyTerms(chapterTitle, matcher)}</h3>`;
     }
 
     if (storage.get<boolean>('showModeNotice') !== false && usedType) {
@@ -999,21 +1562,12 @@ class WTRLAB implements Plugin.PluginBase {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
 
-    const paragraphs: string[] = Array.isArray(chapterContent)
-      ? chapterContent
-      : typeof chapterContent === 'string'
-        ? chapterContent.split('\n')
-        : [];
-
     for (let text of paragraphs) {
       if (typeof text !== 'string') continue;
-      text = resolveTokens(text, true);
-      if (dictionary.length > 0) {
-        text = text.replaceAll(
-          /(?:wtr-lab\s+)?※([0-9]+)[⛬〓]/g,
-          (m: string, index: string) => dictionary[parseInt(index)] || m,
-        );
-      }
+      text = applyTerms(
+        replaceChapterTokens(resolveTokens(text, true), chapterTerms),
+        matcher,
+      );
 
       if (/\[\s*image\s*\]/i.test(text)) {
         const parts = text.split(/(\[\s*image\s*\])/gi);
@@ -2212,12 +2766,65 @@ type ReaderResponse = {
   data?: { data?: ChapterContent };
 };
 
+/**
+ * One glossary row, as both the chapter payload and the novel endpoint send it:
+ *
+ *     [translations, source, type, gender, glossaryId]
+ *
+ * - `translations` — English alternatives; the first is preferred, and the
+ *   site shows `translations[0] || source`.
+ * - `source` — the Chinese form. `|` separates variants and `_` marks optional
+ *   characters, so "天_功法" also matches "天阶功法".
+ * - `type` — 0 none, 1 person, 2 organization, 3 location, 4 technique,
+ *   5 creature, 6 class, 7 skill, 8 talent, 9 ability, 10 event, 11 other,
+ *   12 title, 13 item, 14 preverb.
+ * - `gender` — 0 none, 1 male, 2 female, 3 neutral.
+ * - `glossaryId` — unused. Rows ship 0 (or omit the field) and the site takes
+ *   the real id from the enclosing glossary group instead.
+ *
+ * The labels are WTR Lab's own client-side constants, shared by every novel;
+ * they are recorded here only so the numbers mean something when debugging.
+ * A chapter only ever uses `translations` and `source`.
+ */
+type GlossaryTerm = [
+  translations: string | string[],
+  source: string,
+  type?: number,
+  gender?: number,
+  glossaryId?: number,
+];
+
+type ChapterPatch = {
+  zh?: string;
+  en?: string;
+  tlr?: string;
+};
+
+/** A novel glossary entry: the wording to show and the source forms it covers. */
+type NovelGlossaryTerm = { en: string; zh: string };
+
+type NovelGlossaryResponse = {
+  success?: boolean;
+  raw_id?: number;
+  glossaries?: {
+    type?: string;
+    id?: number;
+    data?: {
+      type?: string;
+      id?: number;
+      terms?: GlossaryTerm[];
+    };
+    terms?: GlossaryTerm[];
+  }[];
+};
+
 type ChapterContent = {
   title: string;
   body: string | string[];
   images?: string[];
+  patch?: ChapterPatch[];
   glossary_data?: {
-    terms: string[][];
+    terms: GlossaryTerm[];
   };
 };
 
