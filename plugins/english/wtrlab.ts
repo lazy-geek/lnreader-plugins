@@ -43,12 +43,18 @@ function renderTermSpan(
   source: string,
   target: string,
   type = 'system',
+  sourceId = '',
 ): string {
-  return `<span class="text-patch ${escapeAttr(type)}" data-hash="${escapeAttr(
+  const sourceIdAttr = sourceId
+    ? ` data-source-id="${escapeAttr(sourceId)}"`
+    : '';
+  return `<span class="text-patch ${escapeAttr(type)}" role="button" tabindex="0" data-hash="${escapeAttr(
     source,
-  )}" data-target="${escapeAttr(target)}" data-type="${escapeAttr(
-    type,
-  )}" style="cursor:pointer;">${escapeHtml(text)}</span>`;
+  )}" data-target="${escapeAttr(target)}" data-ai-target="${escapeAttr(
+    target,
+  )}" data-type="${escapeAttr(type)}"${sourceIdAttr} style="cursor:pointer;">${escapeHtml(
+    text,
+  )}</span>`;
 }
 
 /** Undo the entities Google leaves around translated segments. */
@@ -293,6 +299,7 @@ function buildCombinedGlossary(
           en: userTerm.to,
           zh: userTerm.from,
           type: 'user_term',
+          source_id: userTerm.source_id,
         });
       }
     }
@@ -301,7 +308,12 @@ function buildCombinedGlossary(
 }
 
 /** One glossary mapping: the Chinese source form and the wording to show. */
-type TermReplacement = { source: string; target: string; type?: string };
+type TermReplacement = {
+  source: string;
+  target: string;
+  type?: string;
+  source_id?: string;
+};
 
 /** A glossary term compiled once, then reused for the title and every line. */
 type CompiledTerm = {
@@ -309,6 +321,7 @@ type CompiledTerm = {
   target: string;
   source: string;
   type: string;
+  source_id?: string;
 };
 
 /** A single accepted term occurrence inside a paragraph. */
@@ -319,13 +332,14 @@ type TermHit = {
   target: string;
   source: string;
   type: string;
+  source_id?: string;
 };
 
 function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
   const seen = new Set<string>();
   const compiled: CompiledTerm[] = [];
 
-  for (const { source, target, type } of terms) {
+  for (const { source, target, type, source_id } of terms) {
     if (!source || !target) continue;
     const variants = source
       .split('|')
@@ -351,6 +365,7 @@ function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
         target,
         source,
         type: termType,
+        source_id,
       });
     } catch {
       // A term the regex engine rejects is skipped, not fatal to the chapter.
@@ -366,6 +381,7 @@ type TermSegment = {
   target?: string;
   source?: string;
   type?: string;
+  source_id?: string;
 };
 
 /** A translated paragraph split into untagged text and `<a i=id>` segments. */
@@ -399,7 +415,7 @@ function parseTaggedLine(rawLine: string): TaggedToken[] {
 /** Every place a glossary term occurs, before overlaps are resolved. */
 function collectTermHits(text: string, compiled: CompiledTerm[]): TermHit[] {
   const hits: TermHit[] = [];
-  for (const { pattern, target, source, type } of compiled) {
+  for (const { pattern, target, source, type, source_id } of compiled) {
     pattern.lastIndex = 0;
     let found: RegExpExecArray | null;
     let guard = 0;
@@ -416,6 +432,7 @@ function collectTermHits(text: string, compiled: CompiledTerm[]): TermHit[] {
         target,
         source,
         type,
+        source_id,
       });
     }
   }
@@ -490,6 +507,7 @@ function splitTermSegments(
       target: regularBrackets(hit.target),
       source: hit.source,
       type: hit.type,
+      source_id: hit.source_id,
     });
     if (atBreak || (!han && /^[A-Za-z0-9]/.test(after))) pending = ' ';
 
@@ -508,6 +526,7 @@ function applyTerms(
   text: string,
   compiled: CompiledTerm[],
   highlight = true,
+  sourceId = '',
 ): string {
   return splitTermSegments(text, compiled)
     .map(segment => {
@@ -520,6 +539,7 @@ function applyTerms(
           segment.source || '',
           segment.target,
           segment.type || 'system',
+          segment.source_id || sourceId,
         );
       }
       return escapeHtml(segment.target);
@@ -531,9 +551,10 @@ class WTRLAB implements Plugin.PluginBase {
   id = 'WTRLAB';
   name = 'WTR-LAB';
   site = 'https://wtr-lab.com/';
-  version = '1.5.0';
+  version = '1.5.1';
   icon = 'src/en/wtrlab/icon.png';
   customCSS = 'src/en/wtrlab/custom.css';
+  customJS = 'src/en/wtrlab/custom.js';
   sourceLang = 'en/';
   baggage = '';
   trace = '';
@@ -645,6 +666,21 @@ class WTRLAB implements Plugin.PluginBase {
       value: '',
       label: 'Advanced: Extra custom CSS for terms (e.g. border-radius: 4px;)',
       type: 'Text',
+    },
+    enableTermPopup: {
+      value: true,
+      label: 'Enable interactive term preference popup on tap',
+      type: 'Switch',
+    },
+    termPopupStyle: {
+      value: 'a2',
+      label: 'Term preference popup style',
+      type: 'Select',
+      options: [
+        { label: 'A2: Radio Indicator + Segmented [AI | 99+]', value: 'a2' },
+        { label: 'C2: Accent Border Ring + Segmented [AI | 99+]', value: 'c2' },
+        { label: 'C3: Left Stripe Border + Segmented [AI | 99+]', value: 'c3' },
+      ],
     },
   };
 
@@ -986,6 +1022,31 @@ class WTRLAB implements Plugin.PluginBase {
         const body: NovelGlossaryResponse = await res.json();
         for (const glossary of body?.glossaries ?? []) {
           const data = glossary.data ?? glossary;
+          const isRaw =
+            glossary.raw_id != null ||
+            data?.raw_id != null ||
+            data?.type === 'raw' ||
+            glossary.type === 'raw';
+          const rawGlossaryId =
+            glossary.raw_id ??
+            data?.raw_id ??
+            (data?.type === 'raw' ? data.id : undefined) ??
+            rawId;
+          const genericGlossaryId =
+            glossary.type === 'generic'
+              ? glossary.id
+              : data?.type === 'generic'
+                ? data.id
+                : undefined;
+
+          const glossarySourceId =
+            isRaw && rawGlossaryId != null
+              ? `id.raw.${rawGlossaryId}`
+              : genericGlossaryId != null
+                ? `id.generic.${genericGlossaryId}`
+                : glossary.source_id ||
+                  data?.source_id ||
+                  (rawId ? `id.raw.${rawId}` : '');
           for (const entry of data?.terms ?? []) {
             const alternatives = Array.isArray(entry?.[0])
               ? entry[0]
@@ -1005,7 +1066,11 @@ class WTRLAB implements Plugin.PluginBase {
               const key = termHash(variant.trim());
               // First glossary in the payload wins, matching the site's index.
               if (key && !terms.has(key)) {
-                terms.set(key, { en: preferred, zh: source });
+                terms.set(key, {
+                  en: preferred,
+                  zh: source,
+                  source_id: glossarySourceId,
+                });
               }
             }
           }
@@ -1434,7 +1499,10 @@ class WTRLAB implements Plugin.PluginBase {
     return novel;
   }
 
-  async decrypt(encrypted: string, encKey: string) {
+  async decrypt(
+    encrypted: string,
+    encKey: string,
+  ): Promise<string | string[] | { error: string }> {
     try {
       // t is set to false here; true if arr:
       // If true we parse as json
@@ -1598,6 +1666,7 @@ class WTRLAB implements Plugin.PluginBase {
           source: userTerm.from,
           target: userTerm.to,
           type: 'user_term',
+          source_id: userTerm.source_id,
         });
       }
     }
@@ -1612,6 +1681,7 @@ class WTRLAB implements Plugin.PluginBase {
               source: matched.zh,
               target: matched.en,
               type: matched.type || 'system',
+              source_id: matched.source_id,
             }
           : {
               source,
@@ -1628,6 +1698,7 @@ class WTRLAB implements Plugin.PluginBase {
             source: novel.zh,
             target: novel.en,
             type: novel.type || 'system',
+            source_id: novel.source_id,
           });
         }
       });
@@ -1635,7 +1706,12 @@ class WTRLAB implements Plugin.PluginBase {
 
     for (const patch of patches) {
       if (patch?.zh && patch?.en) {
-        candidates.push({ source: patch.zh, target: patch.en, type: 'patch' });
+        candidates.push({
+          source: patch.zh,
+          target: patch.en,
+          type: 'patch',
+          source_id: patch.source_id,
+        });
       }
     }
 
@@ -1653,6 +1729,7 @@ class WTRLAB implements Plugin.PluginBase {
     chapterTerms: GlossaryTerm[],
     candidates: TermReplacement[],
     highlight = true,
+    sourceId = '',
   ): Promise<string[]> {
     const paragraphs = Array.isArray(paragraphData)
       ? paragraphData
@@ -1694,12 +1771,18 @@ class WTRLAB implements Plugin.PluginBase {
                   segment.source || '',
                   segment.target,
                   segment.type || 'system',
+                  segment.source_id || sourceId,
                 )
               : escapeHtml(segment.target ?? segment.text),
           )
           .join('');
       }
-      return this.rebuildTagged(translated[index], segments, highlight);
+      return this.rebuildTagged(
+        translated[index],
+        segments,
+        highlight,
+        sourceId,
+      );
     });
   }
 
@@ -1708,6 +1791,7 @@ class WTRLAB implements Plugin.PluginBase {
     line: string,
     segments: TermSegment[],
     highlight = true,
+    sourceId = '',
   ): string {
     const tokens = parseTaggedLine(line);
     // The site falls back to the whole translated line when the translator
@@ -1726,6 +1810,7 @@ class WTRLAB implements Plugin.PluginBase {
             seg.source || '',
             seg.target,
             seg.type || 'system',
+            seg.source_id || sourceId,
           );
         }
         return escapeHtml(token.text);
@@ -1770,7 +1855,7 @@ class WTRLAB implements Plugin.PluginBase {
     const cookie = this.sessionCookie;
 
     const attemptLog: string[] = [];
-    let parsedJson;
+    let parsedJson: ReaderResponse | null = null;
     let content: ChapterContent | null = null;
     let usedType: string | null = null;
 
@@ -1802,9 +1887,9 @@ class WTRLAB implements Plugin.PluginBase {
       // Read as text first: an auth redirect or a Cloudflare challenge returns
       // HTML, and .json() would throw before we could report what came back.
       const rawBody = await apiResponse.text();
-      let candidate = null;
+      let candidate: ReaderResponse | null = null;
       try {
-        candidate = JSON.parse(rawBody);
+        candidate = JSON.parse(rawBody) as ReaderResponse;
       } catch (e) {
         candidate = null;
       }
@@ -1875,7 +1960,7 @@ class WTRLAB implements Plugin.PluginBase {
       throw new Error(errorMsg);
     }
 
-    let chapterContent: any = content.body;
+    let chapterContent: string | string[] = content.body;
     const chapterTerms = content.glossary_data?.terms ?? [];
     const isWebPlus = usedType === 'webplus';
     // Web chapters carry no glossary at all, so the novel glossary is only read
@@ -1905,21 +1990,27 @@ class WTRLAB implements Plugin.PluginBase {
     let htmlString = this.buildTermStyleSheet();
 
     const encrypted =
-      chapterContent.toString().startsWith('arr:') ||
-      chapterContent.toString().startsWith('str:');
+      typeof chapterContent === 'string' &&
+      (chapterContent.startsWith('arr:') || chapterContent.startsWith('str:'));
 
-    if (encrypted) {
+    if (encrypted && typeof chapterContent === 'string') {
       if (!loadedCheerio) {
         const body = await this.fetchSite(url).then(res => res.text());
 
         loadedCheerio = parseHTML(body);
       }
       const encKey = await this.getKey(loadedCheerio);
-      chapterContent = await this.decrypt(chapterContent, encKey);
-      if (Object.prototype.hasOwnProperty.call(chapterContent, 'error')) {
-        htmlString += `<p>${chapterContent.error.toString()}</p>`;
+      const decrypted = await this.decrypt(chapterContent, encKey);
+      if (
+        decrypted &&
+        typeof decrypted === 'object' &&
+        !Array.isArray(decrypted) &&
+        'error' in decrypted
+      ) {
+        htmlString += `<p>${decrypted.error}</p>`;
         return htmlString;
       }
+      chapterContent = decrypted;
     }
 
     // The site builds its ordered term list from the raw (decrypted) body:
@@ -1938,6 +2029,8 @@ class WTRLAB implements Plugin.PluginBase {
       userTerms,
     );
 
+    const sourceId = rawId ? `id.raw.${rawId}` : '';
+
     // Web+ is Chinese even when the API did not encrypt the body, and the site
     // translates it either way; AI/Web bodies are only translated when the API
     // marks them encrypted.
@@ -1948,6 +2041,7 @@ class WTRLAB implements Plugin.PluginBase {
             chapterTerms,
             termCandidates,
             highlightTerms,
+            sourceId,
           )
         : await this.translate(chapterContent);
       usedType = `${usedType} + Google Translate (on-device)`;
@@ -1975,13 +2069,28 @@ class WTRLAB implements Plugin.PluginBase {
     );
 
     if (chapterTitle) {
-      htmlString += `<h3>${applyTerms(chapterTitle, matcher, highlightTerms)}</h3>`;
+      htmlString += `<h3>${applyTerms(
+        chapterTitle,
+        matcher,
+        highlightTerms,
+        sourceId,
+      )}</h3>`;
     }
 
     if (storage.get<boolean>('showModeNotice') !== false && usedType) {
+      let translationLabel = usedType;
+      if (usedType.startsWith('ai')) {
+        const modelName = content.model ? escapeHtml(content.model) : '';
+        translationLabel = modelName ? `AI (${modelName})` : 'AI';
+      } else if (isWebPlus) {
+        translationLabel = 'Glossary Enhanced + Google Translate';
+      } else if (usedType === 'web' || usedType.includes('Google Translate')) {
+        translationLabel = 'Google Translate';
+      }
+
       const userTermNotice =
         userTerms.length > 0 ? ` • ${userTerms.length} user terms` : '';
-      htmlString += `<p><small>Translation: ${usedType} — ${cookieState}${userTermNotice}</small></p>`;
+      htmlString += `<p><small>Translation: ${translationLabel} — ${cookieState}${userTermNotice}</small></p>`;
     }
 
     if (attemptLog.length) {
@@ -1992,8 +2101,8 @@ class WTRLAB implements Plugin.PluginBase {
 
     const images: string[] = Array.isArray(content.images)
       ? content.images
-      : Array.isArray((parsedJson as any)?.images)
-        ? (parsedJson as any).images
+      : Array.isArray(parsedJson?.images)
+        ? parsedJson.images
         : [];
     let imageIndex = 0;
 
@@ -2010,6 +2119,7 @@ class WTRLAB implements Plugin.PluginBase {
         replaceChapterTokens(resolveTokens(text, true), chapterTerms),
         matcher,
         highlightTerms,
+        sourceId,
       );
 
       if (/\[\s*image\s*\]/i.test(text)) {
@@ -2046,7 +2156,16 @@ class WTRLAB implements Plugin.PluginBase {
       }
     }
 
-    return htmlString;
+    const enableTermPopup = storage.get<boolean>('enableTermPopup') !== false;
+    const termPopupStyle = (
+      storage.get<string>('termPopupStyle') || 'a2'
+    ).toLowerCase();
+
+    return `<div class="wtr-chapter-content" data-source-id="${escapeAttr(
+      sourceId,
+    )}" data-popup-enabled="${enableTermPopup ? 'true' : 'false'}" data-popup-style="${escapeAttr(
+      termPopupStyle,
+    )}">${htmlString}</div>`;
   }
 
   async fetchAllChapters(
@@ -3205,8 +3324,15 @@ type ChapterData = {
 type ReaderResponse = {
   success?: boolean;
   content_url?: string;
-  chapter?: { title?: string; locked?: boolean };
+  chapter?: {
+    title?: string;
+    locked?: boolean;
+    serie_id?: number;
+  };
   data?: { data?: ChapterContent };
+  images?: string[];
+  error?: string;
+  message?: string;
 };
 
 /**
@@ -3241,10 +3367,16 @@ type ChapterPatch = {
   zh?: string;
   en?: string;
   tlr?: string;
+  source_id?: string;
 };
 
 /** A novel glossary entry: the wording to show and the source forms it covers. */
-type NovelGlossaryTerm = { en: string; zh: string; type?: string };
+type NovelGlossaryTerm = {
+  en: string;
+  zh: string;
+  type?: string;
+  source_id?: string;
+};
 
 type NovelGlossaryResponse = {
   success?: boolean;
@@ -3252,9 +3384,13 @@ type NovelGlossaryResponse = {
   glossaries?: {
     type?: string;
     id?: number;
+    raw_id?: number;
+    source_id?: string;
     data?: {
       type?: string;
       id?: number;
+      raw_id?: number;
+      source_id?: string;
       terms?: GlossaryTerm[];
     };
     terms?: GlossaryTerm[];
@@ -3264,6 +3400,7 @@ type NovelGlossaryResponse = {
 type ChapterContent = {
   title: string;
   body: string | string[];
+  model?: string;
   images?: string[];
   patch?: ChapterPatch[];
   glossary_data?: {
