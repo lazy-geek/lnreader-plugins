@@ -157,7 +157,12 @@ function sourceTermPattern(source: string): string {
 }
 
 /** True when any piece of a term (across `|` variants) occurs in the chapter. */
-function termAppears(text: string, source: string): boolean {
+function termAppears(
+  text: string,
+  source: string,
+  caseSensitive: boolean,
+): boolean {
+  const probeText = caseSensitive ? text : text.toLowerCase();
   return (
     source
       .split('|')
@@ -165,7 +170,11 @@ function termAppears(text: string, source: string): boolean {
       // here too; otherwise "天.阶" would look absent from the text "天阶".
       .flatMap(variant => variant.replace(/[.·\-?？。]/g, '_').split('_'))
       .map(piece => piece.trim())
-      .some(piece => piece.length > 0 && text.includes(piece))
+      .some(piece => {
+        if (!piece) return false;
+        const target = caseSensitive ? piece : piece.toLowerCase();
+        return probeText.includes(target);
+      })
   );
 }
 
@@ -293,6 +302,7 @@ function buildCombinedGlossary(
           en: userTerm.to,
           zh: userTerm.from,
           type: 'user_term',
+          case: userTerm.case,
         });
       }
     }
@@ -301,7 +311,12 @@ function buildCombinedGlossary(
 }
 
 /** One glossary mapping: the Chinese source form and the wording to show. */
-type TermReplacement = { source: string; target: string; type?: string };
+type TermReplacement = {
+  source: string;
+  target: string;
+  type?: string;
+  case?: boolean;
+};
 
 /** A glossary term compiled once, then reused for the title and every line. */
 type CompiledTerm = {
@@ -325,7 +340,7 @@ function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
   const seen = new Set<string>();
   const compiled: CompiledTerm[] = [];
 
-  for (const { source, target, type } of terms) {
+  for (const { source, target, type, case: isCaseSensitive } of terms) {
     if (!source || !target) continue;
     const variants = source
       .split('|')
@@ -334,7 +349,9 @@ function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
     if (variants.length === 0) continue;
 
     const termType = type || 'system';
-    const key = `${variants.join('|')}\u0000${target}\u0000${termType}`;
+    const key = `${variants.join('|')}\u0000${target}\u0000${termType}\u0000${Boolean(
+      isCaseSensitive,
+    )}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
@@ -345,9 +362,9 @@ function buildTermMatcher(terms: TermReplacement[]): CompiledTerm[] {
     if (alternatives.length === 0) continue;
 
     try {
-      // Case-insensitive, like the site: terms are prose, not identifiers.
+      const flags = isCaseSensitive ? 'g' : 'gi';
       compiled.push({
-        pattern: new RegExp(alternatives.join('|'), 'gi'),
+        pattern: new RegExp(alternatives.join('|'), flags),
         target,
         source,
         type: termType,
@@ -531,7 +548,7 @@ class WTRLAB implements Plugin.PluginBase {
   id = 'WTRLAB';
   name = 'WTR-LAB';
   site = 'https://wtr-lab.com/';
-  version = '1.5.0';
+  version = '1.5.2';
   icon = 'src/en/wtrlab/icon.png';
   customCSS = 'src/en/wtrlab/custom.css';
   sourceLang = 'en/';
@@ -1596,11 +1613,12 @@ class WTRLAB implements Plugin.PluginBase {
 
     // 1. User terms that appear in the raw text have top priority
     for (const userTerm of userTerms) {
-      if (termAppears(rawBodyText, userTerm.from)) {
+      if (termAppears(rawBodyText, userTerm.from, Boolean(userTerm.case))) {
         candidates.push({
           source: userTerm.from,
           target: userTerm.to,
           type: 'user_term',
+          case: userTerm.case,
         });
       }
     }
@@ -1615,6 +1633,7 @@ class WTRLAB implements Plugin.PluginBase {
               source: matched.zh,
               target: matched.en,
               type: matched.type || 'system',
+              case: matched.case,
             }
           : {
               source,
@@ -1631,6 +1650,7 @@ class WTRLAB implements Plugin.PluginBase {
             source: novel.zh,
             target: novel.en,
             type: novel.type || 'system',
+            case: novel.case,
           });
         }
       });
@@ -1667,7 +1687,9 @@ class WTRLAB implements Plugin.PluginBase {
 
     const text = prepared.join('\n');
     const compiled = buildTermMatcher(
-      candidates.filter(({ source }) => termAppears(text, source)),
+      candidates.filter(({ source, case: isCase }) =>
+        termAppears(text, source, Boolean(isCase)),
+      ),
     );
     // The site tags even a term-free paragraph (one segment), so keep the same
     // request shape whether or not this chapter has glossary hits.
@@ -1980,7 +2002,9 @@ class WTRLAB implements Plugin.PluginBase {
     ].join('\n');
 
     const matcher = buildTermMatcher(
-      termCandidates.filter(({ source }) => termAppears(probe, source)),
+      termCandidates.filter(({ source, case: isCase }) =>
+        termAppears(probe, source, Boolean(isCase)),
+      ),
     );
 
     if (chapterTitle) {
@@ -3270,7 +3294,12 @@ type ChapterPatch = {
 };
 
 /** A novel glossary entry: the wording to show and the source forms it covers. */
-type NovelGlossaryTerm = { en: string; zh: string; type?: string };
+type NovelGlossaryTerm = {
+  en: string;
+  zh: string;
+  type?: string;
+  case?: boolean;
+};
 
 type NovelGlossaryResponse = {
   success?: boolean;
