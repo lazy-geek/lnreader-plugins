@@ -1434,7 +1434,10 @@ class WTRLAB implements Plugin.PluginBase {
     return novel;
   }
 
-  async decrypt(encrypted: string, encKey: string) {
+  async decrypt(
+    encrypted: string,
+    encKey: string,
+  ): Promise<string | string[] | { error: string }> {
     try {
       // t is set to false here; true if arr:
       // If true we parse as json
@@ -1770,7 +1773,7 @@ class WTRLAB implements Plugin.PluginBase {
     const cookie = this.sessionCookie;
 
     const attemptLog: string[] = [];
-    let parsedJson;
+    let parsedJson: ReaderResponse | null = null;
     let content: ChapterContent | null = null;
     let usedType: string | null = null;
 
@@ -1802,9 +1805,9 @@ class WTRLAB implements Plugin.PluginBase {
       // Read as text first: an auth redirect or a Cloudflare challenge returns
       // HTML, and .json() would throw before we could report what came back.
       const rawBody = await apiResponse.text();
-      let candidate = null;
+      let candidate: ReaderResponse | null = null;
       try {
-        candidate = JSON.parse(rawBody);
+        candidate = JSON.parse(rawBody) as ReaderResponse;
       } catch (e) {
         candidate = null;
       }
@@ -1875,7 +1878,7 @@ class WTRLAB implements Plugin.PluginBase {
       throw new Error(errorMsg);
     }
 
-    let chapterContent: any = content.body;
+    let chapterContent: string | string[] = content.body;
     const chapterTerms = content.glossary_data?.terms ?? [];
     const isWebPlus = usedType === 'webplus';
     // Web chapters carry no glossary at all, so the novel glossary is only read
@@ -1905,21 +1908,27 @@ class WTRLAB implements Plugin.PluginBase {
     let htmlString = this.buildTermStyleSheet();
 
     const encrypted =
-      chapterContent.toString().startsWith('arr:') ||
-      chapterContent.toString().startsWith('str:');
+      typeof chapterContent === 'string' &&
+      (chapterContent.startsWith('arr:') || chapterContent.startsWith('str:'));
 
-    if (encrypted) {
+    if (encrypted && typeof chapterContent === 'string') {
       if (!loadedCheerio) {
         const body = await this.fetchSite(url).then(res => res.text());
 
         loadedCheerio = parseHTML(body);
       }
       const encKey = await this.getKey(loadedCheerio);
-      chapterContent = await this.decrypt(chapterContent, encKey);
-      if (Object.prototype.hasOwnProperty.call(chapterContent, 'error')) {
-        htmlString += `<p>${chapterContent.error.toString()}</p>`;
+      const decrypted = await this.decrypt(chapterContent, encKey);
+      if (
+        decrypted &&
+        typeof decrypted === 'object' &&
+        !Array.isArray(decrypted) &&
+        'error' in decrypted
+      ) {
+        htmlString += `<p>${decrypted.error}</p>`;
         return htmlString;
       }
+      chapterContent = decrypted;
     }
 
     // The site builds its ordered term list from the raw (decrypted) body:
@@ -1979,9 +1988,19 @@ class WTRLAB implements Plugin.PluginBase {
     }
 
     if (storage.get<boolean>('showModeNotice') !== false && usedType) {
+      let translationLabel = usedType;
+      if (usedType.startsWith('ai')) {
+        const modelName = content.model ? escapeHtml(content.model) : '';
+        translationLabel = modelName ? `AI (${modelName})` : 'AI';
+      } else if (isWebPlus) {
+        translationLabel = 'Glossary Enhanced + Google Translate';
+      } else if (usedType === 'web' || usedType.includes('Google Translate')) {
+        translationLabel = 'Google Translate';
+      }
+
       const userTermNotice =
         userTerms.length > 0 ? ` • ${userTerms.length} user terms` : '';
-      htmlString += `<p><small>Translation: ${usedType} — ${cookieState}${userTermNotice}</small></p>`;
+      htmlString += `<p><small>Translation: ${translationLabel} — ${cookieState}${userTermNotice}</small></p>`;
     }
 
     if (attemptLog.length) {
@@ -1992,8 +2011,8 @@ class WTRLAB implements Plugin.PluginBase {
 
     const images: string[] = Array.isArray(content.images)
       ? content.images
-      : Array.isArray((parsedJson as any)?.images)
-        ? (parsedJson as any).images
+      : Array.isArray(parsedJson?.images)
+        ? parsedJson.images
         : [];
     let imageIndex = 0;
 
@@ -3205,8 +3224,15 @@ type ChapterData = {
 type ReaderResponse = {
   success?: boolean;
   content_url?: string;
-  chapter?: { title?: string; locked?: boolean };
+  chapter?: {
+    title?: string;
+    locked?: boolean;
+    serie_id?: number;
+  };
   data?: { data?: ChapterContent };
+  images?: string[];
+  error?: string;
+  message?: string;
 };
 
 /**
@@ -3264,6 +3290,7 @@ type NovelGlossaryResponse = {
 type ChapterContent = {
   title: string;
   body: string | string[];
+  model?: string;
   images?: string[];
   patch?: ChapterPatch[];
   glossary_data?: {
